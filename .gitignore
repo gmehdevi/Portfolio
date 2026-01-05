@@ -1,0 +1,23 @@
+# Node / SvelteKit
+node_modules
+.svelte-kit
+build
+.vite
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+build/
+cmake-build-*/
+CMakeFiles
+CMakeCache.txt
+cmake_install.cmake
+Makefile

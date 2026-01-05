@@ -1,0 +1,44 @@
+services:
+  dev:
+    build:
+      context: .
+      target: deps
+    working_dir: /app
+    command: >
+      sh -c "if [ ! -d node_modules ]; then cp -a /opt/node_modules /app/; fi &&
+             npm run dev -- --host 0.0.0.0 --port 5173"
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+      - sveltekit:/app/.svelte-kit
+      - buildcache:/app/build
+    environment:
+      NODE_ENV: development
+
+  cpp:
+    image: emscripten/emsdk:3.1.65
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cppbuild:/workspace/build
+    command: >
+      sh -c "cmake -S . -B /workspace/build && cmake --build /workspace/build"
+
+  prod:
+    build:
+      context: .
+      target: runtime
+    working_dir: /app
+    command: node build
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+
+volumes:
+  node_modules:
+  sveltekit:
+  buildcache:
+  cppbuild:
