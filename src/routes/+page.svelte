@@ -1,7 +1,9 @@
 <script lang="ts">
+  import { base } from '$app/paths';
   import { listSimulations } from '$lib/simulation/registry';
 
   const sims = listSimulations();
+  const hrefFor = (path: string) => `${base}${path}`;
 </script>
 
 <section class="hero">
@@ -16,12 +18,12 @@
 
 <section class="grid">
   {#each sims as sim}
-    <a class="card" href={`/sim/${sim.slug}`}>
+    <a class="card" href={hrefFor(`/sim/${sim.slug}`)}>
       <div class="title">{sim.name}</div>
       <p>{sim.description}</p>
     </a>
   {/each}
-  <a class="card" href="/viewer">
+  <a class="card" href={hrefFor('/viewer')}>
     <div class="title">Model Viewer</div>
     <p>Test renderer with a sphere and camera controls.</p>
   </a>

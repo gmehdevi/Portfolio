@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { base } from '$app/paths';
   const { children } = $props();
 </script>
 
@@ -10,7 +11,7 @@
   <header class="topbar">
     <div class="brand">SimHost</div>
     <nav class="nav">
-      <a href="/">Gallery</a>
+      <a href={`${base}/`}>Gallery</a>
     </nav>
   </header>
   <main>
