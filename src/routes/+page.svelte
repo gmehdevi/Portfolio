@@ -1,3 +1,9 @@
+<script lang="ts">
+  import { listSimulations } from '$lib/simulation/registry';
+
+  const sims = listSimulations();
+</script>
+
 <section class="hero">
   <div>
     <p class="eyebrow">Client-side Physics</p>
@@ -9,10 +15,12 @@
 </section>
 
 <section class="grid">
-  <a class="card" href="/sim/pendulum">
-    <div class="title">3D Elastic Pendulum</div>
-    <p>Chain of masses with configurable stiffness, damping, and gravity.</p>
-  </a>
+  {#each sims as sim}
+    <a class="card" href={`/sim/${sim.slug}`}>
+      <div class="title">{sim.name}</div>
+      <p>{sim.description}</p>
+    </a>
+  {/each}
   <a class="card" href="/viewer">
     <div class="title">Model Viewer</div>
     <p>Test renderer with a sphere and camera controls.</p>

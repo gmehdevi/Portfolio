@@ -15,7 +15,7 @@ prod:
 
 # Drop containers/volumes
 down:
-	@docker compose -f compose.yml down
+	@docker compose -f compose.yml down --remove-orphans
 
 # Shell into dev container (useful for npm/cmake inside container only)
 shell:
@@ -27,12 +27,9 @@ cmake-build:
 
 # Clean generated artifacts while keeping the project runnable
 clean: down
-	@docker compose -f compose.yml down -v
-	@docker volume rm -f node_modules sveltekit buildcache cppbuild 2>/dev/null || true
-	@docker run --rm -v $$PWD:/workspace busybox sh -c "rm -rf /workspace/build /workspace/.svelte-kit /workspace/node_modules"
+	@docker compose -f compose.yml down -v --remove-orphans
 	@rm -rf build .svelte-kit node_modules
 
 # Full clean: remove all containers and call clean
 fclean: clean
-	@docker rm -f $$(docker ps -aq) 2>/dev/null || true
-	@docker rmi $$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^portfolio' || true) 2>/dev/null || true
+	@docker compose -f compose.yml down -v --remove-orphans --rmi local

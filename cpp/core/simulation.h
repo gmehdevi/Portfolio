@@ -12,4 +12,5 @@ public:
   virtual int getBufferSize(int bufferId) const = 0;
   virtual void setParams(const void* params, int size) = 0;
   virtual Diagnostics getDiagnostics() const = 0;
+  virtual bool supportsIntegrator(IntegratorId) const { return false; }
 };

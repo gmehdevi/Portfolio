@@ -1,189 +1,303 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { createRenderer } from '$lib/renderer';
-  import { createSimulationRuntime, type SimParams } from '$lib/wasm/loader';
-  import { makeOrbitCamera, makeFlyCamera, viewMatrix, perspective, type CameraState, forward, right, mulMat4 } from '$lib/renderer/camera';
+  import { browser } from '$app/environment';
+  import { createSimulationHost } from '$lib/simulation/host';
+  import { getSimulationBySlug } from '$lib/simulation/registry';
+  import { createCameraRig, type CameraRig } from '$lib/camera/rig';
+  import { makeCameraForMode } from '$lib/camera/math';
+  import InspectorPanel from '$lib/ui/InspectorPanel.svelte';
+  import DiagnosticsPanel from '$lib/ui/DiagnosticsPanel.svelte';
+  import type { CameraMode } from '$lib/camera/types';
+  import { DEFAULT_INTEGRATORS, type IntegratorOption } from '$lib/wasm/loader';
+  import type { SimParams, SimConfig, Diagnostics } from '$lib/wasm/loader';
 
   const { data } = $props();
-  const sim = $derived(data.sim);
+  const slug = $derived(data.slug);
+  const sim = $derived(getSimulationBySlug(slug)!);
 
   let status = $state('booting...');
   let canvas: HTMLCanvasElement | null = null;
-  let params: SimParams = $state({
+  let viewport: HTMLDivElement | null = null;
+  let isFullscreen = $state(false);
+  const baseParams: SimParams = {
     stiffness: 30,
     damping: 0.2,
     gravity: 9.81,
-    restLength: 0.5
-  });
-  let config = $state({ particleCount: 16, initialAngle: 0.4 });
-
-  let stop: (() => void) | null = null;
-  let runtimeRef: Awaited<ReturnType<typeof createSimulationRuntime>> | null = null;
-  let camera: CameraState = $state(makeOrbitCamera());
-  let mode: 'orbit' | 'fly' = $state('orbit');
-  let keys = new Set<string>();
-
-  const translate = (dir: [number, number, number], amt: number) => {
-    if (camera.mode !== 'fly') return;
-    camera.position = [
-      camera.position[0] + dir[0] * amt,
-      camera.position[1] + dir[1] * amt,
-      camera.position[2] + dir[2] * amt
-    ];
+    restLength: 0.5,
+    integrator: 0
   };
+  const baseConfig: SimConfig = { particleCount: 16, initialTheta: 0, initialPhi: 0.4 };
+  let params: SimParams = $state({ ...baseParams });
+  let config: SimConfig = $state({ ...baseConfig });
 
-  const handleKeyDown = (ev: KeyboardEvent) => {
-    const k = ev.key.toLowerCase();
-    keys.add(k);
-    canvas?.focus();
-    if (ev.key === 'f') {
-      mode = mode === 'orbit' ? 'fly' : 'orbit';
-      camera = mode === 'orbit' ? makeOrbitCamera() : makeFlyCamera();
-    }
-  };
-  const handleKeyUp = (ev: KeyboardEvent) => keys.delete(ev.key.toLowerCase());
-
-  let dragging = false;
-  let lastX = 0;
-  let lastY = 0;
+  let mode: CameraMode = $state('orbit');
+  let camera = $state(makeCameraForMode('orbit'));
   let locked = $state(false);
 
-  const onPointerDown = (e: PointerEvent) => {
-    dragging = true;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    if (mode === 'fly') {
-      (e.currentTarget as HTMLElement).requestPointerLock?.();
-    }
-  };
-  const onPointerUp = () => {
-    dragging = false;
-    document.exitPointerLock?.();
-  };
-  const onPointerMove = (e: PointerEvent) => {
-    const dx = e.movementX || e.clientX - lastX;
-    const dy = e.movementY || e.clientY - lastY;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    const sens = 0.004;
-    if (mode === 'fly') {
-      camera.yaw += dx * sens;
-      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + dy * sens));
-    } else if (dragging) {
-      camera.yaw += dx * sens;
-      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + dy * sens));
-    }
-  };
-  const onWheel = (e: WheelEvent) => {
-    if (camera.mode === 'orbit') {
-      camera.distance = Math.max(0.5, camera.distance * (1 + e.deltaY * 0.001));
-    }
+  let host: ReturnType<typeof createSimulationHost> | null = null;
+  let detachCamera: (() => void) | null = null;
+  let diagnostics: Diagnostics | null = $state(null);
+  let integrators: IntegratorOption[] = $state(DEFAULT_INTEGRATORS);
+  let renderFps = $state(60);
+  let fixedDt = $state(1 / 120);
+  let timeMode: 'fixed' | 'dynamic' = $state('dynamic');
+  let isInteracting = $state(false);
+  const controls = $derived(sim.controls ?? []);
+  let lastSlug = $state('');
+
+  let rig: CameraRig | null = null;
+
+  $effect(() => {
+    if (slug === lastSlug) return;
+    lastSlug = slug;
+    params = { ...baseParams, ...(sim.defaults?.params ?? {}) };
+    config = { ...baseConfig, ...(sim.defaults?.config ?? {}) };
+    const nextMode = sim.camera.default;
+    mode = nextMode;
+    camera = makeCameraForMode(nextMode);
+    renderFps = sim.defaults?.renderFps ?? 60;
+    fixedDt = sim.defaults?.fixedDt ?? 1 / 120;
+    timeMode = sim.defaults?.timeMode ?? 'dynamic';
+  });
+
+  const createRig = () => {
+    if (rig) return rig;
+    rig = createCameraRig({
+      profile: sim.camera,
+      getCamera: () => camera,
+      setCamera: (next) => {
+        camera = next;
+      },
+      getMode: () => mode,
+      setMode: (next) => {
+        mode = next;
+      },
+      onLockChange: (value) => {
+        locked = value;
+      },
+      moveSpeed: 2.5
+    });
+    return rig;
   };
 
   const startRuntime = async () => {
-    if (!canvas) return;
-    const renderer = createRenderer(canvas, 'pendulum');
-    const runtime = await createSimulationRuntime();
-    runtimeRef = runtime;
-    status = 'WASM/JS runtime ready';
+    if (!canvas || !rig) return;
+    if (!host) {
+      host = createSimulationHost({
+        canvas,
+        descriptor: sim,
+        cameraRig: rig,
+        onStatus: (value) => {
+          status = value;
+        },
+        onDiagnostics: (next) => {
+          diagnostics = next;
+        },
+        renderFps,
+        fixedDt,
+        timeMode
+      });
+    }
+    await host.start({ params, config });
+    host.setRenderFps(renderFps);
+    host.setFixedDt(fixedDt);
+    host.setTimeMode(timeMode);
+    host.setPaused(isInteracting);
+    const runtime = host.getRuntime();
+    diagnostics = runtime ? runtime.diagnostics() : null;
+    integrators = runtime ? runtime.getIntegrators() : DEFAULT_INTEGRATORS;
+  };
 
-    let last = performance.now();
-    let raf = 0;
-    const loop = () => {
-      const now = performance.now();
-      const dt = (now - last) * 0.001;
-      last = now;
-      runtime.step(dt, 2);
-      const aspect = canvas.width / Math.max(1, canvas.height);
-      const proj = perspective(Math.PI / 3, aspect, 0.01, 200);
-      const view = viewMatrix(camera);
-      const viewProj = mulMat4(proj, view);
-      if (mode === 'fly') {
-        const move = 2.5 * (1 / 60);
-        const f = forward(camera);
-        const r = right(camera);
-        if (keys.has('w')) translate(f, move);
-        if (keys.has('s')) translate(f, -move);
-        if (keys.has('a')) translate(r, -move);
-        if (keys.has('d')) translate(r, move);
-        if (keys.has('q') || keys.has('shift')) camera.position[1] -= move;
-        if (keys.has('e') || keys.has(' ')) camera.position[1] += move;
+  const stopRuntime = () => {
+    host?.stop();
+  };
+
+  const applyDefaults = () => {
+    const nextParams = { ...baseParams, ...(sim.defaults?.params ?? {}) };
+    const nextConfig = { ...baseConfig, ...(sim.defaults?.config ?? {}) };
+    const nextRenderFps = sim.defaults?.renderFps ?? 60;
+    const nextFixedDt = sim.defaults?.fixedDt ?? 1 / 120;
+    const nextTimeMode = sim.defaults?.timeMode ?? 'dynamic';
+    params = nextParams;
+    config = nextConfig;
+    renderFps = nextRenderFps;
+    fixedDt = nextFixedDt;
+    timeMode = nextTimeMode;
+    localStorage.setItem(`sim:${slug}:renderFps`, `${renderFps}`);
+    localStorage.setItem(`sim:${slug}:fixedDt`, `${fixedDt}`);
+    localStorage.setItem(`sim:${slug}:timeMode`, timeMode);
+    host?.setParams(nextParams);
+    host?.setConfig(nextConfig);
+    host?.setRenderFps(nextRenderFps);
+    host?.setFixedDt(nextFixedDt);
+    host?.setTimeMode(nextTimeMode);
+  };
+
+  const resetAll = () => {
+    const nextMode = mode;
+    if (rig) {
+      rig.setMode(nextMode);
+    } else {
+      mode = nextMode;
+    }
+    applyDefaults();
+    void startRuntime();
+  };
+
+  const updateParams = (next: Partial<SimParams>) => {
+    params = { ...params, ...next };
+    host?.setParams(params);
+  };
+
+  const updateConfig = (next: Partial<SimConfig>) => {
+    config = { ...config, ...next };
+    host?.setConfig(config);
+  };
+
+    const updateRuntime = (key: 'renderFps' | 'fixedDt' | 'timeMode', value: number | string) => {
+      if (key === 'renderFps') {
+        renderFps = Number(value);
+        host?.setRenderFps(renderFps);
+        localStorage.setItem(`sim:${slug}:renderFps`, `${renderFps}`);
+        return;
       }
-      renderer.render({ mode: 'pendulum', positions: runtime.getPositions() }, viewProj);
-      raf = requestAnimationFrame(loop);
+      if (key === 'fixedDt') {
+        const next = Number(value);
+        if (!Number.isFinite(next) || next <= 0 || next > 1) return;
+        fixedDt = next;
+        host?.setFixedDt(fixedDt);
+        localStorage.setItem(`sim:${slug}:fixedDt`, `${fixedDt}`);
+        return;
+      }
+      if (key === 'timeMode') {
+        timeMode = value === 'dynamic' ? 'dynamic' : 'fixed';
+        host?.setTimeMode(timeMode);
+        localStorage.setItem(`sim:${slug}:timeMode`, timeMode);
+      }
     };
-    raf = requestAnimationFrame(loop);
 
-    stop = () => {
-      cancelAnimationFrame(raf);
-      runtime.destroy();
-      renderer.dispose();
-      runtimeRef = null;
+  onMount(() => {
+    if (!browser) return;
+    if (!canvas) return;
+    const fpsKey = `sim:${slug}:renderFps`;
+    const storedFps = localStorage.getItem(fpsKey);
+    if (storedFps) {
+      const parsed = Number(storedFps);
+      if (Number.isFinite(parsed)) {
+        renderFps = parsed;
+      }
+    }
+    const dtKey = `sim:${slug}:fixedDt`;
+    const storedDt = localStorage.getItem(dtKey);
+    if (storedDt) {
+      const parsed = Number(storedDt);
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= 1) {
+        fixedDt = parsed;
+      }
+    }
+    const modeKey = `sim:${slug}:timeMode`;
+    const storedMode = localStorage.getItem(modeKey);
+    if (storedMode === 'dynamic' || storedMode === 'fixed') {
+      timeMode = storedMode;
+    }
+    rig = createRig();
+    detachCamera = rig.attach({ canvas });
+    void startRuntime();
+    const onFullscreenChange = () => {
+      isFullscreen = document.fullscreenElement === viewport;
     };
-  };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || /^(input|textarea|select)$/i.test(target.tagName))) {
+        return;
+      }
+      if (event.key.toLowerCase() !== 'f') return;
+      event.preventDefault();
+      void toggleFullscreen();
+    };
+    const onReset = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || /^(input|textarea|select)$/i.test(target.tagName))) {
+        return;
+      }
+      if (event.key.toLowerCase() !== 'r') return;
+      event.preventDefault();
+      resetAll();
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', onReset);
+    return () => {
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keydown', onReset);
+      detachCamera?.();
+      stopRuntime();
+    };
+  });
 
-  const updateParams = () => {
-    if (runtimeRef) {
-      runtimeRef.setParams(params);
+  const toggleFullscreen = async () => {
+    if (!browser || !viewport) return;
+    if (document.fullscreenElement === viewport) {
+      await document.exitFullscreen();
+      return;
     }
+    await viewport.requestFullscreen();
   };
-
-  const updateConfig = () => {
-    if (runtimeRef?.setConfig) {
-      runtimeRef.setConfig(config);
-    }
-  };
-
-  // 4x4 multiply: a*b
-  </script>
+</script>
 
 <svelte:head>
   <title>{sim.name} | SimHost</title>
 </svelte:head>
 
 <section class="layout">
-  <div class="viewport">
-    <canvas bind:this={canvas} id="gl-canvas" aria-label="Simulation viewport"></canvas>
-    <div class="overlay">
-      <div class="label">{sim.name}</div>
-      <div class="hint">{status}</div>
+  <div class="main">
+    <div class="viewport" bind:this={viewport}>
+      <canvas bind:this={canvas} id="gl-canvas" aria-label="Simulation viewport"></canvas>
+      <div class="viewport-actions">
+        <button type="button" class="ghost" onclick={toggleFullscreen}>
+          {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+        </button>
+      </div>
+      <div class="overlay">
+        <div class="label">{sim.name}</div>
+        <div class="hint">{status}{locked ? ' (Pointer lock: Esc to exit)' : ''}</div>
+      </div>
+    </div>
+    <div class="diagnostics-panel">
+      <DiagnosticsPanel
+        {diagnostics}
+        sampleCount={config.particleCount}
+        sampleRate={renderFps > 0 ? renderFps : 60}
+        resetKey={slug}
+      />
     </div>
   </div>
   <aside class="panel">
     <h2>Controls</h2>
-    <div class="control">
-      <label for="stiffness">Stiffness</label>
-      <input id="stiffness" type="range" min="1" max="100" step="1" bind:value={params.stiffness} onchange={updateParams} />
-      <span>{params.stiffness.toFixed(1)}</span>
-    </div>
-    <div class="control">
-      <label for="damping">Damping</label>
-      <input id="damping" type="range" min="0" max="5" step="0.05" bind:value={params.damping} onchange={updateParams} />
-      <span>{params.damping.toFixed(2)}</span>
-    </div>
-    <div class="control">
-      <label for="gravity">Gravity</label>
-      <input id="gravity" type="range" min="0" max="20" step="0.1" bind:value={params.gravity} onchange={updateParams} />
-      <span>{params.gravity.toFixed(2)}</span>
-    </div>
-    <div class="control">
-      <label for="restlength">Rest Length</label>
-      <input id="restlength" type="range" min="0.1" max="2.0" step="0.05" bind:value={params.restLength} onchange={updateParams} />
-      <span>{params.restLength.toFixed(2)}</span>
-    </div>
-    <div class="control">
-      <label for="count">Particles</label>
-      <input id="count" type="range" min="2" max="64" step="1" bind:value={config.particleCount} onchange={updateConfig} />
-      <span>{config.particleCount}</span>
-    </div>
-    <div class="control">
-      <label for="angle">Initial Angle (rad)</label>
-      <input id="angle" type="range" min="-1.5" max="1.5" step="0.05" bind:value={config.initialAngle} onchange={updateConfig} />
-      <span>{config.initialAngle.toFixed(2)}</span>
-    </div>
+    <p class="keymap">
+      Keys: C toggle camera, F fullscreen, R reset. Fly: click viewport, WASD, Q/E or Space/Shift.
+    </p>
+    <InspectorPanel
+      {controls}
+      {params}
+      {config}
+      runtime={{ renderFps, fixedDt, timeMode, integrators }}
+      onParamsChange={updateParams}
+      onConfigChange={updateConfig}
+      onRuntimeChange={updateRuntime}
+      onInteractionChange={(active) => {
+        isInteracting = active;
+        host?.setPaused(active);
+      }}
+    />
     <div class="control row">
-      <button type="button" onclick={startRuntime}>Restart</button>
-      <button type="button" onclick={() => (mode = mode === 'orbit' ? 'fly' : 'orbit')}>
+      <button type="button" onclick={resetAll}>Restart</button>
+      <button type="button" onclick={() => rig?.toggleMode()}>
         Camera: {mode}
       </button>
     </div>
@@ -196,6 +310,12 @@
     grid-template-columns: minmax(0, 1fr) 320px;
     gap: 1rem;
   }
+  .main {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    height: 100%;
+  }
   .viewport {
     position: relative;
     border-radius: 16px;
@@ -203,12 +323,28 @@
     border: 1px solid #1f2937;
     background: radial-gradient(circle at 20% 20%, rgba(56, 189, 248, 0.12), rgba(15, 23, 42, 1));
     min-height: 480px;
+    flex: 1 1 auto;
+  }
+  :global(.viewport:fullscreen) {
+    border-radius: 0;
+    border: none;
+    width: 100%;
+    height: 100%;
+  }
+  :global(.viewport:fullscreen canvas) {
+    height: 100%;
   }
   canvas {
     display: block;
     width: 100%;
     height: 100%;
     background: transparent;
+  }
+  .viewport-actions {
+    position: absolute;
+    top: 0.75rem;
+    right: 0.75rem;
+    z-index: 2;
   }
   .overlay {
     position: absolute;
@@ -232,6 +368,18 @@
     padding: 1rem;
     background: rgba(30, 41, 59, 0.75);
   }
+  .keymap {
+    margin: 0 0 0.75rem 0;
+    font-size: 0.8rem;
+    color: #94a3b8;
+    line-height: 1.4;
+  }
+  .diagnostics-panel {
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    padding: 0.75rem 1rem 1rem;
+    background: rgba(15, 23, 42, 0.7);
+  }
   h2 {
     margin-top: 0;
   }
@@ -245,18 +393,6 @@
   .control.row {
     grid-template-columns: 1fr 1fr;
   }
-  .control label {
-    grid-column: 1 / 3;
-    font-size: 0.9rem;
-    color: #94a3b8;
-  }
-  .control input[type='range'] {
-    grid-column: 1 / 2;
-  }
-  .control span {
-    text-align: right;
-    font-family: monospace;
-  }
   button {
     padding: 0.35rem 0.5rem;
     border-radius: 8px;
@@ -268,6 +404,19 @@
   }
   button:hover {
     background: #38bdf8;
+  }
+  .viewport-actions .ghost {
+    border-radius: 999px;
+    padding: 0.35rem 0.65rem;
+    font-size: 0.75rem;
+    border: 1px solid rgba(148, 163, 184, 0.5);
+    background: rgba(15, 23, 42, 0.85);
+    color: #e2e8f0;
+    font-weight: 600;
+    box-shadow: 0 4px 12px rgba(15, 23, 42, 0.4);
+  }
+  .viewport-actions .ghost:hover {
+    background: rgba(30, 41, 59, 0.95);
   }
   @media (max-width: 900px) {
     .layout {

@@ -3,140 +3,112 @@
   import { createRenderer } from '$lib/renderer';
   import { makeSphere } from '$lib/renderer/mesh';
   import { parseOBJ } from '$lib/renderer/obj';
-  import { makeOrbitCamera, makeFlyCamera, viewMatrix, perspective, type CameraState, forward, right, mulMat4 } from '$lib/renderer/camera';
+  import { buildMeshPacket, buildPointPacket, buildSpherePacket, BUFFER_INDICES, BUFFER_NORMALS, BUFFER_POSITIONS, BUFFER_UVS } from '$lib/renderer/packet';
+  import { createTextureFromImage } from '$lib/renderer/texture';
+  import { createCameraRig, type CameraRig } from '$lib/camera/rig';
+  import { makeCameraForMode } from '$lib/camera/math';
+  import type { CameraMode } from '$lib/camera/types';
+  import { createRenderLoop } from '$lib/ui/renderLoop';
 
   let canvas: HTMLCanvasElement | null = null;
-  let viewportEl: HTMLDivElement | null = null;
-  let camera: CameraState = $state(makeOrbitCamera());
-  let mode: 'orbit' | 'fly' = $state('orbit');
+  let camera = $state(makeCameraForMode('orbit'));
+  let mode: CameraMode = $state('orbit');
   let status = $state('booting...');
 
-  let dragging = false;
-  let lastX = 0;
-  let lastY = 0;
-
-  let positions = $state(makeSphere(32).positions);
-  let normals = $state(makeSphere(32).normals);
-  let uvs = $state<Float32Array | undefined>(makeSphere(32).uvs);
-  let indices = $state(makeSphere(32).indices);
+  const baseSphere = makeSphere(32);
+  let positions = $state(baseSphere.positions);
+  let normals = $state(baseSphere.normals);
+  let uvs = $state<Float32Array | undefined>(baseSphere.uvs);
+  let indices = $state(baseSphere.indices);
   let radius = $state(1);
   let texture: WebGLTexture | null = null;
   let rendererRef: ReturnType<typeof createRenderer> | null = null;
-  let keys = new Set<string>();
+  let packetCache: Uint32Array | null = null;
   let shading = $state(1); // 0 unlit, 1 lambert, 2 phong
   let lightYaw = $state(0.8);
   let lightPitch = $state(0.6);
   let locked = $state(false);
+  let renderMode = $state<'mesh' | 'points' | 'spheres'>('mesh');
 
-  const translate = (dir: [number, number, number], amt: number) => {
-    if (camera.mode !== 'fly') return;
-    camera.position = [
-      camera.position[0] + dir[0] * amt,
-      camera.position[1] + dir[1] * amt,
-      camera.position[2] + dir[2] * amt
-    ];
-  };
+  let detachCamera: (() => void) | null = null;
 
-  const handleKeyDown = (ev: KeyboardEvent) => {
-    const k = ev.key.toLowerCase();
-    keys.add(k);
-    canvas?.focus();
-    if (ev.key === 'f') {
-      mode = mode === 'orbit' ? 'fly' : 'orbit';
-      camera = mode === 'orbit' ? makeOrbitCamera() : makeFlyCamera();
-    }
-  };
-  const handleKeyUp = (ev: KeyboardEvent) => keys.delete(ev.key.toLowerCase());
+  let rig: CameraRig | null = null;
 
-  const onPointerDown = (e: PointerEvent) => {
-    dragging = true;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    if (mode === 'fly') {
-      (e.currentTarget as HTMLElement).requestPointerLock?.();
-    }
+  const createRig = () => {
+    if (rig) return rig;
+    rig = createCameraRig({
+      profile: { default: 'orbit', allowed: ['orbit', 'fly'], invertY: true },
+      getCamera: () => camera,
+      setCamera: (next) => {
+        camera = next;
+      },
+      getMode: () => mode,
+      setMode: (next) => {
+        mode = next;
+      },
+      onLockChange: (value) => {
+        locked = value;
+      },
+      moveSpeed: 5
+    });
+    return rig;
   };
-  const onPointerUp = () => {
-    dragging = false;
-    document.exitPointerLock?.();
-  };
-  const onPointerMove = (e: PointerEvent) => {
-    const dx = e.movementX || e.clientX - lastX;
-    const dy = e.movementY || e.clientY - lastY;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    const sens = 0.004;
-    if (mode === 'fly') {
-      camera.yaw += dx * sens;
-      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + dy * sens));
-    } else if (dragging) {
-      camera.yaw += dx * sens;
-      camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch + dy * sens));
-    }
-  };
-  const onWheel = (e: WheelEvent) => {
-    if (camera.mode === 'orbit') {
-      camera.distance = Math.max(0.5, camera.distance * (1 + e.deltaY * 0.001));
-    }
-  };
-
-  let stop: (() => void) | null = null;
 
   onMount(() => {
     if (!canvas) return;
-    const renderer = createRenderer(canvas, 'mesh');
-    rendererRef = renderer;
+    rendererRef = createRenderer(canvas);
     status = 'renderer ready';
-    let raf = 0;
-    const loop = () => {
-      const aspect = canvas.width / Math.max(1, canvas.height);
-      const far = Math.max(100, radius * 10);
-      const proj = perspective(Math.PI / 3, aspect, 0.01, far);
-      const view = viewMatrix(camera);
-      const viewProj = mulMat4(proj, view);
-      if (mode === 'fly') {
-        const move = 5 * (1 / 60);
-        const f = forward(camera);
-        const r = right(camera);
-        if (keys.has('w')) translate(f, move);
-        if (keys.has('s')) translate(f, -move);
-        if (keys.has('a')) translate(r, -move);
-        if (keys.has('d')) translate(r, move);
-        if (keys.has('q') || keys.has('shift')) camera.position[1] -= move;
-        if (keys.has('e') || keys.has(' ')) camera.position[1] += move;
+    rig = createRig();
+    detachCamera = rig.attach({ canvas });
+    const loop = createRenderLoop({
+      onFrame: (dt) => {
+        if (!rig) return;
+        rig.update(dt);
+        const activeRenderer = rendererRef;
+        if (!activeRenderer) return;
+        const aspect = canvas.width / Math.max(1, canvas.height);
+        const far = Math.max(100, radius * 10);
+        const viewProj = rig.viewProj(aspect, 0.01, far);
+        const lx = Math.cos(lightPitch) * Math.cos(lightYaw);
+        const ly = Math.sin(lightPitch);
+        const lz = Math.cos(lightPitch) * Math.sin(lightYaw);
+        const count = Math.floor(positions.length / 3);
+        if (renderMode === 'mesh') {
+          packetCache = buildMeshPacket(indices.length, { previous: packetCache ?? undefined });
+          if (packetCache) {
+            const buffers: Record<number, Float32Array | Uint16Array | Uint32Array> = {
+              [BUFFER_POSITIONS]: positions,
+              [BUFFER_NORMALS]: normals,
+              [BUFFER_INDICES]: indices
+            };
+            if (uvs) {
+              buffers[BUFFER_UVS] = uvs;
+            }
+            activeRenderer.render(
+              { mode: 'packet', packet: packetCache, buffers, material: { shading, lightDir: [lx, ly, lz], lightColor: [1, 1, 1], texture } },
+              viewProj
+            );
+          }
+        } else {
+          if (renderMode === 'points') {
+            packetCache = buildPointPacket(count, 6.0, packetCache ?? undefined);
+          } else {
+            packetCache = buildSpherePacket(count, 0.03, packetCache ?? undefined);
+          }
+          if (packetCache) {
+            activeRenderer.render({ mode: 'packet', packet: packetCache, buffers: { [BUFFER_POSITIONS]: positions } }, viewProj);
+          }
+        }
       }
-      renderer.render({ mode: 'mesh', positions, normals, indices, uvs, texture }, viewProj);
-      const lx = Math.cos(lightPitch) * Math.cos(lightYaw);
-      const ly = Math.sin(lightPitch);
-      const lz = Math.cos(lightPitch) * Math.sin(lightYaw);
-      renderer.render({ mode: 'mesh', positions, normals, indices, uvs, texture, shading, lightDir: [lx, ly, lz], lightColor: [1, 1, 1] }, viewProj);
-      raf = requestAnimationFrame(loop);
-    };
-    raf = requestAnimationFrame(loop);
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('pointerup', onPointerUp);
-    window.addEventListener('pointermove', onPointerMove);
-    window.addEventListener('wheel', onWheel, { passive: true });
-    const onLockChange = () => {
-      locked = document.pointerLockElement === canvas;
-      if (!locked) dragging = false;
-    };
-    document.addEventListener('pointerlockchange', onLockChange);
-    stop = () => {
-      cancelAnimationFrame(raf);
-      renderer.dispose();
+    });
+    loop.start();
+    return () => {
+      loop.stop();
+      detachCamera?.();
+      rendererRef?.dispose();
       rendererRef = null;
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('pointerup', onPointerUp);
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('wheel', onWheel);
-      document.removeEventListener('pointerlockchange', onLockChange);
+      packetCache = null;
     };
-    return stop;
   });
 
   const loadObj = async (file: File) => {
@@ -156,7 +128,7 @@
     normals = parsed.normals;
     indices = parsed.indices;
     uvs = parsed.uvs;
-    camera = mode === 'orbit' ? makeOrbitCamera() : makeFlyCamera();
+    camera = makeCameraForMode(mode);
   };
 
   const loadTexture = async (file: File) => {
@@ -166,20 +138,12 @@
     const img = new Image();
     img.src = url;
     await img.decode();
-    if (rendererRef) {
-      const gl = (rendererRef as any).gl as WebGL2RenderingContext | undefined;
-      if (gl) {
-        const tex = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_2D, tex);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-        gl.generateMipmap(gl.TEXTURE_2D);
-        texture = tex;
+    const gl = rendererRef?.gl;
+    if (gl) {
+      if (texture) {
+        gl.deleteTexture(texture);
       }
+      texture = createTextureFromImage(gl, img);
     }
     URL.revokeObjectURL(url);
   };
@@ -223,7 +187,7 @@
   <aside class="panel">
     <h2>Controls</h2>
     <p>Orbit: drag + wheel. Fly: press F then WASD + mouse look.</p>
-    <button type="button" onclick={() => { mode = mode === 'orbit' ? 'fly' : 'orbit'; camera = mode === 'orbit' ? makeOrbitCamera() : makeFlyCamera(); }}>
+    <button type="button" onclick={() => rig?.toggleMode()}>
       Toggle Camera ({mode})
     </button>
     <div class="control">
@@ -240,6 +204,14 @@
         <option value={0}>Unlit</option>
         <option value={1}>Lambert</option>
         <option value={2}>Phong</option>
+      </select>
+    </div>
+    <div class="control">
+      <label for="rendermode">Render Mode</label>
+      <select id="rendermode" bind:value={renderMode}>
+        <option value="mesh">Mesh</option>
+        <option value="points">Points</option>
+        <option value="spheres">Spheres</option>
       </select>
     </div>
     <div class="control">

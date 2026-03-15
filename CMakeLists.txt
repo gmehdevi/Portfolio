@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(physics STATIC
+  cpp/core/camera_api.cpp
   cpp/core/sim_api.cpp
   cpp/core/sim_registry.cpp
   cpp/sims/sim_pendulum3d.cpp

@@ -1,20 +1,17 @@
+import { error } from '@sveltejs/kit';
 import type { PageLoad } from './$types';
+import { getSimulationBySlug, listSimulations } from '$lib/simulation/registry';
 
-const registry = {
-	pendulum: {
-		slug: 'pendulum',
-		name: '3D Elastic Pendulum',
-		description: 'Chain of masses with configurable stiffness, damping, and gravity.'
-	}
+export const prerender = true;
+
+export const entries = () => {
+	return listSimulations().map((sim) => ({ slug: sim.slug }));
 };
 
 export const load: PageLoad = ({ params }) => {
-	const sim = registry[params.slug as keyof typeof registry];
+	const sim = getSimulationBySlug(params.slug);
 	if (!sim) {
-		return {
-			status: 404,
-			error: new Error('Simulation not found')
-		};
+		throw error(404, 'Simulation not found');
 	}
-	return { sim };
+	return { slug: sim.slug };
 };

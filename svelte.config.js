@@ -1,4 +1,6 @@
-import adapter from '@sveltejs/adapter-node';
+import adapter from '@sveltejs/adapter-static';
+
+const base = process.env.NODE_ENV === 'production' ? '/Portfolio' : '';
 
 const config = {
   compilerOptions: {
@@ -6,6 +8,9 @@ const config = {
   },
   kit: {
     adapter: adapter(),
+    paths: {
+      base
+    },
     alias: {
       $lib: 'src/lib'
     }
